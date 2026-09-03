@@ -3,6 +3,14 @@ export interface MessageItem {
     content: string
 }
 
+export interface ConversationItem {
+    id: string
+    title: string
+    messages: MessageItem[]
+    conversationId?: string
+    updatedAt: number
+}
+
 export interface SendMessage {
     inputs: object
     query: string

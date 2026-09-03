@@ -1,9 +1,16 @@
+interface DifyStreamEvent {
+    event?: string
+    answer?: string
+    conversation_id?: string
+    message?: string
+}
+
 export async function streamChat(
     query: string,
-    onChunk: (text: string) => void,
-    onEnd: () => void,
+    conversationId: string | undefined,
+    onChunk: (chunk: string) => void,
     signal: AbortSignal
-) {
+): Promise<string | undefined> {
     const res = await fetch('/dify-api/v1/chat-messages', {
         method: 'POST',
         headers: {
@@ -12,45 +19,64 @@ export async function streamChat(
         body: JSON.stringify({
             inputs: {},
             query,
-            user: 'demo-user',
-            response_mode: 'streaming'
+            user: 'user1',
+            response_mode: 'streaming',
+            ...(conversationId ? { conversation_id: conversationId } : {})
         }),
         signal
     })
 
     if(!res.ok) {
-        throw new Error(`Request failed with status ${res.status}`)
+        throw new Error(`连接失败（${res.status}）`)
     }
 
     const reader = res.body?.getReader()
     if(!reader) {
-        throw new Error('Failed to get reader from response body')
+        throw new Error('响应失败')
     }
     const decoder = new TextDecoder()
+    let buffer = ''
+    let currentConversationId = conversationId
+
+    const handleEvent = (eventBlock: string) => {
+        const data = eventBlock
+            .split(/\r?\n/)
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+            .join('\n')
+
+        if(!data) return false
+        if(data === '[DONE]') return true
+
+        const event = JSON.parse(data) as DifyStreamEvent
+        if(event.conversation_id) {
+            currentConversationId = event.conversation_id
+        }
+        if(event.event === 'message' && event.answer) {
+            onChunk(event.answer)
+        }
+        if(event.event === 'error') {
+            throw new Error(event.message || '响应失败')
+        }
+        return event.event === 'message_end'
+    }
 
     while(true) {
         const {done, value} = await reader.read()
         if(done) break
 
-        const chunk = decoder.decode(value, {stream: true})
+        buffer += decoder.decode(value, {stream: true})
+        const eventBlocks = buffer.split(/\r?\n\r?\n/)
+        buffer = eventBlocks.pop() || ''
 
-        const lines = chunk.split('\n').filter(line => line.trim() !== '')
-        for(const line of lines) {
-            if(!line.startsWith('data: ')) {
-                continue
+        for(const eventBlock of eventBlocks) {
+            if(handleEvent(eventBlock)) {
+                return currentConversationId
             }
-            const dataStr = line.replace('data:', '').trim()
-            if(dataStr === '[DONE]') {
-                onEnd()
-                return
-            }
-            try {
-                const json = JSON.parse(dataStr)
-                if(json.event === 'message' && json.answer){
-                    onChunk(json.answer)
-                }
-            } catch(err) {}
         }
     }
-    onEnd()
+
+    buffer += decoder.decode()
+    if(buffer.trim()) handleEvent(buffer)
+    return currentConversationId
 }
