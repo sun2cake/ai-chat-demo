@@ -1,6 +1,7 @@
 export interface MessageItem {
     role: 'user' | 'ai'
     content: string
+    originalQuery?: string
 }
 
 export interface ConversationItem {

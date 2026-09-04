@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref } from 'vue'
+import { computed, nextTick, reactive, ref, shallowRef } from 'vue'
 import { renderMarkdown } from './utils/markdown'
 import { streamChat } from './utils/streamChat'
 import type { ConversationItem, MessageItem } from './types/index'
@@ -37,6 +37,7 @@ const activeConversationId = ref(
 )
 const inputText = ref('')
 const loading = ref(false)
+const activeController = shallowRef<AbortController | null>(null)
 const sidebarOpen = ref(false)
 const conversationScroll = ref<HTMLElement | null>(null)
 const promptInput = ref<HTMLTextAreaElement | null>(null)
@@ -88,29 +89,42 @@ const handleSelectConversation = (id: string) => {
   scrollToBottom()
 }
 
-const handleSend = async () => {
-  const text = inputText.value.trim()
-  const conversation = activeConversation.value
-  if(!text || !conversation || loading.value) return
+const handleDeleteConversation = (id: string) => {
+  if(loading.value) return
 
-  conversation.messages.push({ role: 'user', content: text })
-  if(conversation.messages.length === 1) {
-    conversation.title = text.length > 18 ? `${text.slice(0, 18)}…` : text
+  const conversation = conversations.value.find(item => item.id === id)
+  if(!conversation || !window.confirm(`删除会话“${conversation.title}”？此操作无法撤销。`)) return
+
+  conversations.value = conversations.value.filter(item => item.id !== id)
+
+  if(conversations.value.length === 0) {
+    const newConversation = createConversation()
+    conversations.value.push(newConversation)
+    activeConversationId.value = newConversation.id
+  } else if(activeConversationId.value === id) {
+    activeConversationId.value = conversations.value[0].id
   }
 
-  const aiMessage = reactive<MessageItem>({ role: 'ai', content: '' })
-  conversation.messages.push(aiMessage)
-  conversation.updatedAt = Date.now()
-  inputText.value = ''
-  loading.value = true
   persistConversations()
   scrollToBottom()
+}
 
+const handleStop = () => {
+  activeController.value?.abort()
+}
+
+const generateResponse = async (
+  query: string,
+  conversation: ConversationItem,
+  aiMessage: MessageItem
+) => {
+  loading.value = true
   const controller = new AbortController()
+  activeController.value = controller
 
   try {
     const conversationId = await streamChat(
-      text,
+      query,
       conversation.conversationId,
       (chunk) => {
         aiMessage.content += chunk
@@ -122,14 +136,69 @@ const handleSend = async () => {
       conversation.conversationId = conversationId
     }
   } catch(err) {
-    aiMessage.content = err instanceof Error ? err.message : '请求出错，请稍后再试'
+    if(!(err instanceof DOMException && err.name === 'AbortError')) {
+      aiMessage.content = err instanceof Error ? err.message : '请求出错，请稍后再试'
+    }
   } finally {
+    if(activeController.value === controller) {
+      activeController.value = null
+    }
     loading.value = false
     conversation.updatedAt = Date.now()
     conversations.value.sort((a, b) => b.updatedAt - a.updatedAt)
     persistConversations()
     scrollToBottom()
   }
+}
+
+const handleSend = async () => {
+  const text = inputText.value.trim()
+  const conversation = activeConversation.value
+  if(!text || !conversation || loading.value) return
+
+  conversation.messages.push({ role: 'user', content: text })
+  if(conversation.messages.length === 1) {
+    conversation.title = text.length > 18 ? `${text.slice(0, 18)}…` : text
+  }
+
+  const aiMessage = reactive<MessageItem>({
+    role: 'ai',
+    content: '',
+    originalQuery: text
+  })
+  conversation.messages.push(aiMessage)
+  conversation.updatedAt = Date.now()
+  inputText.value = ''
+  persistConversations()
+  scrollToBottom()
+
+  await generateResponse(text, conversation, aiMessage)
+}
+
+const handleRetry = async (messageIndex: number) => {
+  const conversation = activeConversation.value
+  const aiMessage = conversation?.messages[messageIndex]
+  if(!conversation || !aiMessage || aiMessage.role !== 'ai' || loading.value) return
+
+  let originalQuery = aiMessage.originalQuery
+  if(!originalQuery) {
+    for(let index = messageIndex - 1; index >= 0; index -= 1) {
+      const message = conversation.messages[index]
+      if(message.role === 'user') {
+        originalQuery = message.content
+        break
+      }
+    }
+  }
+  if(!originalQuery) return
+
+  aiMessage.originalQuery = originalQuery
+  aiMessage.content = ''
+  conversation.updatedAt = Date.now()
+  persistConversations()
+  scrollToBottom()
+
+  await generateResponse(originalQuery, conversation, aiMessage)
 }
 </script>
 
@@ -194,21 +263,36 @@ const handleSend = async () => {
         </div>
 
         <nav class="conversation-history" aria-label="历史对话">
-          <button
+          <div
             v-for="conversation in conversations"
             :key="conversation.id"
-            class="conversation-item"
+            class="conversation-row"
             :class="{ 'is-active': conversation.id === activeConversationId }"
-            type="button"
-            :disabled="loading"
-            :aria-current="conversation.id === activeConversationId ? 'page' : undefined"
-            @click="handleSelectConversation(conversation.id)"
           >
-            <span class="conversation-title">{{ conversation.title }}</span>
-            <span class="conversation-meta">
-              {{ conversation.messages.length ? `${conversation.messages.length} 条消息` : '尚未开始' }}
-            </span>
-          </button>
+            <button
+              class="conversation-item"
+              type="button"
+              :disabled="loading"
+              :aria-current="conversation.id === activeConversationId ? 'page' : undefined"
+              @click="handleSelectConversation(conversation.id)"
+            >
+              <span class="conversation-title">{{ conversation.title }}</span>
+              <span class="conversation-meta">
+                {{ conversation.messages.length ? `${conversation.messages.length} 条消息` : '尚未开始' }}
+              </span>
+            </button>
+            <button
+              class="delete-conversation"
+              type="button"
+              :disabled="loading"
+              :aria-label="`删除会话：${conversation.title}`"
+              @click="handleDeleteConversation(conversation.id)"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" />
+              </svg>
+            </button>
+          </div>
         </nav>
 
         <p class="storage-note">会话仅保存在当前浏览器</p>
@@ -237,7 +321,21 @@ const handleSend = async () => {
             >
               <span class="message-label">{{ item.role === 'user' ? '你' : 'AI' }}</span>
               <div v-if="item.role === 'user'" class="user-content">{{ item.content }}</div>
-              <div v-else class="md-body" v-html="renderMarkdown(item.content)"></div>
+              <template v-else>
+                <div class="md-body" v-html="renderMarkdown(item.content)"></div>
+                <div class="message-actions">
+                  <button
+                    class="retry-button"
+                    type="button"
+                    :disabled="loading"
+                    aria-label="重新生成这条回答"
+                    @click="handleRetry(index)"
+                  >
+                    <span aria-hidden="true">↻</span>
+                    重试
+                  </button>
+                </div>
+              </template>
             </article>
           </div>
         </section>
@@ -256,8 +354,16 @@ const handleSend = async () => {
             ></textarea>
             <div class="composer-actions">
               <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
-              <button class="send-button" type="submit" :disabled="loading || !inputText.trim()">
-                {{ loading ? '生成中' : '发送' }}
+              <button
+                v-if="loading"
+                class="send-button stop-button"
+                type="button"
+                @click="handleStop"
+              >
+                停止生成
+              </button>
+              <button v-else class="send-button" type="submit" :disabled="!inputText.trim()">
+                发送
               </button>
             </div>
           </form>
@@ -431,7 +537,8 @@ const handleSend = async () => {
 }
 
 .new-conversation:disabled,
-.conversation-item:disabled {
+.conversation-item:disabled,
+.delete-conversation:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }
@@ -467,28 +574,69 @@ const handleSend = async () => {
   overflow-y: auto;
 }
 
+.conversation-row {
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: var(--radius-tag);
+  transition: border-color 180ms ease, background 180ms ease;
+}
+
+.conversation-row.is-active {
+  border-color: var(--color-border);
+  background: rgba(255, 190, 61, 0.09);
+}
+
 .conversation-item {
   width: 100%;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid transparent;
-  border-radius: var(--radius-tag);
+  padding: var(--space-3) 44px var(--space-3) var(--space-3);
+  border: 0;
+  border-radius: inherit;
   color: var(--color-text);
   background: transparent;
   text-align: left;
   cursor: pointer;
-  transition: border-color 180ms ease, background 180ms ease;
+  transition: background 180ms ease;
 }
 
 .conversation-item:hover:not(:disabled) {
   background: rgba(247, 242, 232, 0.05);
 }
 
-.conversation-item.is-active {
+.delete-conversation {
+  position: absolute;
+  top: 50%;
+  right: var(--space-2);
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-tag);
+  color: var(--color-muted);
+  background: transparent;
+  cursor: pointer;
+  opacity: 0.72;
+  transform: translateY(-50%);
+  transition: color 180ms ease, border-color 180ms ease, opacity 180ms ease;
+}
+
+.delete-conversation svg {
+  width: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.delete-conversation:hover:not(:disabled) {
   border-color: var(--color-border);
-  background: rgba(255, 190, 61, 0.09);
+  color: var(--color-primary);
+  opacity: 1;
 }
 
 .conversation-title {
@@ -753,6 +901,36 @@ const handleSend = async () => {
   background: rgba(255, 190, 61, 0.06);
 }
 
+.message-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-3);
+}
+
+.retry-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-tag);
+  color: var(--color-muted);
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 180ms ease, border-color 180ms ease, opacity 180ms ease;
+}
+
+.retry-button:hover:not(:disabled) {
+  border-color: var(--color-border);
+  color: var(--color-primary);
+}
+
+.retry-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .composer-shell {
   flex: none;
   padding: var(--space-3) clamp(var(--space-6), 5vw, var(--space-16)) var(--space-6);
@@ -831,6 +1009,16 @@ const handleSend = async () => {
   background: transparent;
 }
 
+.stop-button {
+  color: var(--color-primary);
+  background: transparent;
+}
+
+.stop-button:hover:not(:disabled) {
+  color: var(--color-background);
+  background: var(--color-primary);
+}
+
 .send-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
@@ -843,7 +1031,9 @@ const handleSend = async () => {
 .sidebar-trigger:focus-visible,
 .new-conversation:focus-visible,
 .conversation-item:focus-visible,
+.delete-conversation:focus-visible,
 .return-link:focus-visible,
+.retry-button:focus-visible,
 .send-button:focus-visible {
   outline: 3px solid var(--color-primary);
   outline-offset: 4px;
@@ -938,8 +1128,11 @@ const handleSend = async () => {
   .sidebar,
   .return-link,
   .new-conversation,
+  .conversation-row,
   .conversation-item,
+  .delete-conversation,
   .composer,
+  .retry-button,
   .send-button {
     transition-duration: 0.01ms;
   }
